@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <title>View Logs</title>
+    <style>
+      :root { --bg:#0b0d10; --panel:#11151a; --muted:#8b949e; --text:#e6edf3; --brand:#2da44e; --accent:#238636; --danger:#d73a49; --line:#21262d; }
+      .theme-light { --bg:#ffffff; --panel:#f6f8fa; --muted:#57606a; --text:#24292f; --brand:#2da44e; --accent:#238636; --danger:#cf222e; --line:#d0d7de; }
+      * { box-sizing: border-box; }
+      html, body { background: var(--bg); color: var(--text); overflow-x: hidden; }
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 12px; width: 520px; margin: 0 auto; }
+      h1 { font-size: 16px; margin: 0 0 8px; }
+      .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; min-width: 0; }
+      .spread { justify-content: space-between; }
+      label { font-size: 12px; color: var(--muted); }
+      input, textarea, select { width: 100%; max-width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+      input::placeholder { color: #6e7681; }
+      input[type="number"] { width: 120px; }
+      button { padding: 6px 10px; cursor: pointer; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 8px; }
+      button:hover { border-color: #30363d; }
+      .btn-primary { background: var(--brand); border-color: var(--accent); color: #ffffff; }
+      .btn-primary:hover { filter: brightness(0.95); }
+      pre { max-height: 240px; overflow: auto; background: var(--panel); padding: 8px; border-radius: 8px; border: 1px solid var(--line); }
+      .small { font-size: 12px; color: var(--muted); }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+      .table-wrap { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+      .table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+      .table th, .table td { padding: 8px 10px; text-align: left; vertical-align: top; }
+      #ia-table tbody td:nth-child(1) { padding-right: 0; }
+      #ia-table tbody td:nth-child(2) { padding-left: 8px; }
+      .table thead th { background: #0e1318; color: #c9d1d9; border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 1; }
+      .theme-light .table thead th { background: #eff1f4; color: #24292f; }
+      .table tbody tr { border-bottom: 1px solid var(--line); }
+      .table tbody tr:hover { background: rgba(255,255,255,0.03); }
+      .theme-light .table tbody tr:hover { background: rgba(0,0,0,0.03); }
+      .status { display: flex; gap: 12px; align-items: center; }
+      .status-item { display: flex; gap: 6px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; display: inline-block; }
+      .green { background: var(--brand); }
+      .red { background: var(--danger); }
+      .nav { display: flex; gap: 8px; }
+      .nav button { padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); }
+      .nav button.active { background: rgba(45,164,78,0.15); border-color: var(--brand); color: var(--text); }
+      .hidden { display: none; }
+      .settings-grid { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 8px 10px; align-items: center; }
+      .chip { display: inline-block; padding: 2px 8px; border-radius: 999px; background: rgba(45,164,78,0.15); color: #91d1a7; border: 1px solid rgba(45,164,78,0.35); font-variant-numeric: tabular-nums; }
+      .badge { display: inline-block; min-width: 18px; padding: 0 6px; text-align: center; border-radius: 999px; background: #18202a; color: #c9d1d9; border: 1px solid var(--line); font-size: 11px; margin-left: 6px; }
+      .theme-light .badge { background: #e7ebf0; color: #24292f; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+      .muted { color: var(--muted); }
+      .caret { margin-left: 6px; opacity: 0.8; }
+      .toggle { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-start; }
+      .settings-grid input[type="checkbox"] { width: auto; height: auto; margin: 0; }
+      .html-preview { background: rgba(255,255,255,0.02); border: 1px dashed var(--line); padding: 6px; border-radius: 8px; max-height: 120px; overflow: auto; }
+      .target-icon { font-weight: 800; margin-right: 4px; }
+      .meta-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+      .pill { display: inline-flex; gap: 6px; align-items: center; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; background: rgba(140, 148, 158, 0.12); color: var(--muted); font-size: 11px; }
+      .clock-icon { font-weight: 700; }
+      .hsvg-holder { padding-bottom: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="row spread">
+      <div class="row" style="margin-bottom:0;">
+        <h1>🔱  PosEyeDOM</h1>
+      </div>
+      <div class="row" style="margin-bottom:0;">
+        <div class="nav">
+          <button id="nav-home" class="active">🏠 Home</button>
+          <button id="nav-settings" style="margin-right:8px;">⚙️ Settings</button>
+        </div>
+        <button id="detach-window" title="Open in separate window">↗</button>
+      </div>
+    </div>
+
+    <div class="row status" id="status-bar">
+      <div class="status-item"><span id="dot-db" class="dot"></span><span class="small">DB</span></div>
+      <div class="status-item"><span id="dot-tracking" class="dot"></span><span class="small">Tracking</span></div>
+    </div>
+
+    <div id="view-home">
+      <div class="panel" style="margin-bottom: 10px;">
+        <div class="row" style="margin-bottom: 0; justify-content: space-between; align-items: flex-start;">
+          <div style="display:flex; flex-direction:column; gap:8px; flex:1; align-items:flex-start;">
+            <input id="participant-id" placeholder="Participant ID" style="width:180px;" />
+            <input id="offset-ms" type="number" placeholder="Sync Key Offset (ms)" style="width:180px;" />
+          </div>
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            <button id="export-ia-html" class="btn-primary">Export IA + HTML</button>
+            <button id="clear-db">Clear Database</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="row small" id="ia-summary-title">Live IA summary (auto-updating)</div>
+      <div class="table-wrap">
+        <table class="table" id="ia-table">
+          <thead>
+            <tr>
+              <th style="width:48px;">#</th>
+              <th>Label</th>
+              <th style="width:120px;">Duration</th>
+            </tr>
+          </thead>
+          <tbody id="ia-tbody">
+            <tr><td colspan="3" class="small muted">No data yet…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel" style="margin-top: 10px;">
+        <div class="row spread" style="margin-bottom:6px;">
+          <div class="small">Raw Log Stream</div>
+          <div class="row" style="margin-bottom:0;">
+            <button id="view-logs">Show Logs</button>
+            <button id="export-logs">Export Logs</button>
+          </div>
+        </div>
+        <div id="logs-container" class="hidden">
+          <pre id="logs"></pre>
+        </div>
+      </div>
+    </div>
+
+    <div id="view-settings" class="hidden panel">
+      <div class="settings-grid">
+        <label for="cfg-sync-key" class="small">Sync key</label>
+        <input id="cfg-sync-key" placeholder="e.g. s" />
+
+        <label for="cfg-selectors" class="small">Query selectors</label>
+        <input id="cfg-selectors" placeholder=".ghost-text-decoration, .ghost-text" />
+
+        <label for="cfg-remote-url" class="small">Remote URL</label>
+        <input id="cfg-remote-url" placeholder="https://..." />
+
+        <label for="cfg-throttle" class="small">Throttle (ms)</label>
+        <input id="cfg-throttle" type="number" min="0" placeholder="200" />
+
+        <label for="cfg-window-offset" class="small">Window offset (px)</label>
+        <input id="cfg-window-offset" type="number" min="0" placeholder="91" />
+
+        <label for="cfg-err-h" class="small">Error margin H (px)</label>
+        <input id="cfg-err-h" type="number" min="0" placeholder="44" />
+
+        <label for="cfg-err-v" class="small">Error margin V (px)</label>
+        <input id="cfg-err-v" type="number" min="0" placeholder="22" />
+
+        <label for="cfg-theme" class="small">Light mode</label>
+        <label class="toggle"><input id="cfg-theme" type="checkbox" /> <span class="small">Enable</span></label>
+      </div>
+      <div class="row" style="margin-top: 24px;">
+        <button id="save-settings" class="btn-primary">Save & Restart</button>
+        <button id="reset-settings">Reset defaults</button>
+      </div>
+      <div class="small" id="settings-status"></div>
+      <div class="small muted" style="margin-top:6px;">Saving changes will trigger a VS Code and Extension Reload.</div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
