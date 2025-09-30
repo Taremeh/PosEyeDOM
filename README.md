@@ -24,7 +24,7 @@ PosEyeDOM is a Chrome/Edge MV3 extension that tracks inline code suggestion over
 ### Install (Load Unpacked)
 1. Open extensions: `chrome://extensions` (Chrome) or `edge://extensions` (Edge)
 2. Enable Developer mode.
-3. Click “Load unpacked” and select the `div-logger-extension/` folder in this repo.
+3. Click “Load unpacked” and select this repo folder.
 4. Pin the extension; click the toolbar icon to open the dashboard.
 
 Tip: Use ↗ “Detach” in the popup to open a standalone dashboard window.
