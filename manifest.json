@@ -1,18 +1,29 @@
 {
     "manifest_version": 3,
-    "name": "PosEyeDOMm",
+    "name": "PosEyeDOM",
     "version": "2.0",
     "permissions": ["scripting", "storage", "tabs", "windows"],
     "host_permissions": [
     "*://*.github.dev/*"
     ],
     "background": {
-      "service_worker": "background.js"
+      "service_worker": "background.js",
+      "type": "module"
     },
     "content_scripts": [
       {
         "matches": ["*://*.github.dev/*"],
-        "js": ["content.js"],
+        "js": [
+          "src/content/00_namespace.js",
+          "src/content/10_utils.js",
+          "src/content/20_ia_computer.js",
+          "src/content/config/index.js",
+          "src/content/tracking/logging.js",
+          "src/content/tracking/acceptance.js",
+          "src/content/tracking/observer.js",
+          "src/content/tracking/index.js",
+          "src/content/99_entry.js"
+        ],
         "run_at": "document_start",
         "all_frames": true
       }

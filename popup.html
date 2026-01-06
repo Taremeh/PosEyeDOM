@@ -145,6 +145,10 @@
 
         <label for="cfg-remote-url" class="small">Remote URL</label>
         <input id="cfg-remote-url" placeholder="https://..." />
+        <div></div>
+        <div class="small muted" style="margin-top:-4px;">
+          Note: the Remote URL host must also be added to <span class="mono">manifest.json</span> → <span class="mono">host_permissions</span>.
+        </div>
 
         <label for="cfg-throttle" class="small">Throttle (ms)</label>
         <input id="cfg-throttle" type="number" min="0" placeholder="200" />
@@ -169,6 +173,14 @@
       <div class="small muted" style="margin-top:6px;">Saving changes will trigger a VS Code and Extension Reload.</div>
     </div>
 
-    <script src="popup.js"></script>
+    <script src="src/popup/00_namespace.js"></script>
+    <script src="src/popup/05_settings.js"></script>
+    <script src="src/popup/10_db.js"></script>
+    <script src="src/popup/20_download.js"></script>
+    <script src="src/popup/30_tabs.js"></script>
+    <script src="src/popup/40_export_ia_html.js"></script>
+    <script src="src/popup/50_ia_summary.js"></script>
+    <script src="src/popup/60_status.js"></script>
+    <script src="src/popup/99_entry.js"></script>
   </body>
 </html>
