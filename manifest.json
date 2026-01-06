@@ -1,6 +1,6 @@
 {
     "manifest_version": 3,
-    "name": "PosEyeDOM",
+    "name": "PosEyeDOMm",
     "version": "2.0",
     "permissions": ["scripting", "storage", "tabs", "windows"],
     "host_permissions": [

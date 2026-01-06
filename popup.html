@@ -57,6 +57,17 @@
       .pill { display: inline-flex; gap: 6px; align-items: center; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; background: rgba(140, 148, 158, 0.12); color: var(--muted); font-size: 11px; }
       .clock-icon { font-weight: 700; }
       .hsvg-holder { padding-bottom: 6px; }
+      .live-chip {
+        background: rgba(88,166,255,0.14);
+        border-color: rgba(88,166,255,0.35);
+        color: #b6d7ff;
+        animation: liveChipPulse 1.2s ease-in-out infinite;
+      }
+      @keyframes liveChipPulse {
+        0% { filter: brightness(1.0); box-shadow: 0 0 0 0 rgba(88,166,255,0.35); }
+        60% { filter: brightness(1.15); box-shadow: 0 0 0 8px rgba(88,166,255,0.0); }
+        100% { filter: brightness(1.0); box-shadow: 0 0 0 0 rgba(88,166,255,0.0); }
+      }
     </style>
   </head>
   <body>
@@ -75,7 +86,9 @@
 
     <div class="row status" id="status-bar">
       <div class="status-item"><span id="dot-db" class="dot"></span><span class="small">DB</span></div>
-      <div class="status-item"><span id="dot-tracking" class="dot"></span><span class="small">Tracking</span></div>
+      <div id="status-tracking-chip" class="status-item" style="cursor:pointer;">
+        <span id="dot-tracking" class="dot"></span><span id="status-tracking-label" class="small">Tracking</span>
+      </div>
     </div>
 
     <div id="view-home">

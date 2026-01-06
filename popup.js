@@ -10,6 +10,52 @@ function openDatabase() {
   });
 }
 
+function pickGithubDevTab(cb) {
+  try {
+    chrome.tabs.query({ url: ["*://*.github.dev/*"] }, (tabs) => {
+      if (chrome.runtime.lastError) { cb(null); return; }
+      if (tabs && tabs.length) {
+        const activeFocused = tabs.find(t => t.active && t.highlighted) || null;
+        const activeAny = tabs.find(t => t.active) || null;
+        cb(activeFocused || activeAny || tabs[0]);
+      } else {
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }, (t2) => {
+          if (t2 && t2.length && t2[0].url && t2[0].url.includes("github.dev")) cb(t2[0]); else cb(null);
+        });
+      }
+    });
+  } catch (_) { cb(null); }
+}
+
+function reattachTracking() {
+  pickGithubDevTab((tab) => {
+    if (!tab) {
+      alert("No github.dev tab found. Open your github.dev tab and try again.");
+      return;
+    }
+    const tabId = tab.id;
+    const msg = { type: "force_reattach" };
+
+    chrome.tabs.sendMessage(tabId, msg, (resp) => {
+      if (chrome.runtime.lastError) {
+        // When the extension reloads, old content-script contexts become invalidated.
+        // The most reliable "reattach" is to reload the github.dev tab (same effect as user reload).
+        try {
+          chrome.tabs.reload(tabId, { bypassCache: true }, () => {
+            // Give the page a moment to load and content script to attach, then refresh status.
+            setTimeout(() => { try { pollStatus(); } catch (_) {} }, 1200);
+          });
+        } catch (e) {
+          console.error("tabs.reload failed:", e);
+          alert("Could not reattach. Make sure the github.dev tab is open and loaded.");
+        }
+        return;
+      }
+      setTimeout(() => { try { pollStatus(); } catch (_) {} }, 300);
+    });
+  });
+}
+
 function fetchLogs() {
   return new Promise(async (resolve, reject) => {
     try {
@@ -100,23 +146,6 @@ async function computeAndExportIAHTML() {
     const logs = await fetchLogs();
     const participantId = (document.getElementById("participant-id").value || "session").trim();
     const offsetMs = Number(document.getElementById("offset-ms").value || 0);
-
-    function pickGithubDevTab(cb) {
-      try {
-        chrome.tabs.query({ url: ["*://*.github.dev/*"] }, (tabs) => {
-          if (chrome.runtime.lastError) { cb(null); return; }
-          if (tabs && tabs.length) {
-            const activeFocused = tabs.find(t => t.active && t.highlighted) || null;
-            const activeAny = tabs.find(t => t.active) || null;
-            cb(activeFocused || activeAny || tabs[0]);
-          } else {
-            chrome.tabs.query({ active: true, lastFocusedWindow: true }, (t2) => {
-              if (t2 && t2.length && t2[0].url && t2[0].url.includes("github.dev")) cb(t2[0]); else cb(null);
-            });
-          }
-        });
-      } catch (_) { cb(null); }
-    }
 
     pickGithubDevTab((tab) => {
       if (!tab) {
@@ -243,7 +272,10 @@ function groupByRoot(records) {
 }
 
 function msToSeconds(ms) {
-  return (Math.max(0, Number(ms || 0)) / 1000).toFixed(2);
+  const v = Math.max(0, Number(ms || 0)) / 1000;
+  // Note: this string is often inserted via innerHTML, so escape "<".
+  if (v > 0 && v < 0.01) return "&lt;0.01";
+  return v.toFixed(2);
 }
 
 function renderIASummary(records) {
@@ -272,6 +304,7 @@ function renderIASummary(records) {
   groups.forEach((g, idx) => {
     const rootId = g.root;
     const isExpanded = expandState.has(rootId);
+    const groupLive = g.children.some(c => c && c.isActive === true);
     const tr = document.createElement("tr");
     tr.style.cursor = "pointer";
     tr.addEventListener("click", () => {
@@ -291,11 +324,15 @@ function renderIASummary(records) {
 
     const tdDur = document.createElement("td");
     const durationMs = Math.max(0, Number(g.end || 0) - Number(g.start || 0));
-    const groupAccepted = g.children.some(c => !!c.accepted);
-    const chipColor = groupAccepted ? "rgba(45,164,78,0.15)" : "rgba(207,34,46,0.15)";
-    const chipBorder = groupAccepted ? "rgba(45,164,78,0.35)" : "rgba(207,34,46,0.45)";
-    const chipText = groupAccepted ? "#91d1a7" : "#ffb1b8";
-    tdDur.innerHTML = `<span class="chip mono" style="background:${chipColor};border-color:${chipBorder};color:${chipText}">${msToSeconds(durationMs)}s</span>`;
+    if (groupLive) {
+      tdDur.innerHTML = `<span class="pill mono live-chip">${msToSeconds(durationMs)}s</span>`;
+    } else {
+      const groupAccepted = g.children.some(c => c && c.accepted === true);
+      const chipColor = groupAccepted ? "rgba(45,164,78,0.15)" : "rgba(207,34,46,0.15)";
+      const chipBorder = groupAccepted ? "rgba(45,164,78,0.35)" : "rgba(207,34,46,0.45)";
+      const chipText = groupAccepted ? "#91d1a7" : "#ffb1b8";
+      tdDur.innerHTML = `<span class="chip mono" style="background:${chipColor};border-color:${chipBorder};color:${chipText}">${msToSeconds(durationMs)}s</span>`;
+    }
     tr.appendChild(tdDur);
 
     tbody.appendChild(tr);
@@ -444,8 +481,13 @@ function renderIASummary(records) {
       const row3 = document.createElement("tr");
       const row3c1 = document.createElement("td"); row3c1.className = "small muted"; row3c1.style.padding = "0 6px 0 0"; row3c1.textContent = "Accepted";
       const row3c2 = document.createElement("td"); row3c2.className = "small muted mono"; row3c2.style.padding = "0";
-      const acceptedChild = g.children.some(c => !!c.accepted);
-      row3c2.textContent = acceptedChild ? "true" : "false";
+      const liveChild = g.children.some(c => c && c.isActive === true);
+      if (liveChild) {
+        row3c2.textContent = "LIVE (pending)";
+      } else {
+        const acceptedChild = g.children.some(c => c && c.accepted === true);
+        row3c2.textContent = acceptedChild ? "true" : "false";
+      }
       row3.appendChild(row3c1); row3.appendChild(row3c2);
       metaTable.appendChild(row1); metaTable.appendChild(row2); metaTable.appendChild(row3);
       metaContainer.appendChild(metaLabel);
@@ -877,3 +919,16 @@ pollStatus();
 loadSettings();
 // Default to Home view on load
 try { showView("home"); } catch (_) {}
+
+// Tracking chip reattach
+try {
+  const trackingChip = document.getElementById("status-tracking-chip");
+  const trackingLabel = document.getElementById("status-tracking-label");
+  if (trackingChip) trackingChip.addEventListener("click", () => reattachTracking());
+  if (trackingChip && trackingLabel) {
+    const baseText = trackingLabel.textContent || "Tracking";
+    trackingChip.addEventListener("mouseenter", () => { try { trackingLabel.textContent = "Click to reattach"; } catch (_) {} });
+    trackingChip.addEventListener("mouseleave", () => { try { trackingLabel.textContent = baseText; } catch (_) {} });
+    trackingChip.addEventListener("blur", () => { try { trackingLabel.textContent = baseText; } catch (_) {} }, true);
+  }
+} catch (_) {}

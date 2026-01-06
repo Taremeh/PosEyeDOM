@@ -10,6 +10,45 @@ function throttle(func, delay) {
   };
 }
 
+// --- Runtime safety: avoid noisy "Extension context invalidated" spam after reloads ---
+let TRACKING_DISABLED = false;
+function disableTracking(reason) {
+  if (TRACKING_DISABLED) return;
+  TRACKING_DISABLED = true;
+  try { stopObserver(); } catch (_) {}
+  try { stopActivePoll(); } catch (_) {}
+  try {
+    if (SUGG_STATE && SUGG_STATE.compareTimer) { clearTimeout(SUGG_STATE.compareTimer); SUGG_STATE.compareTimer = null; }
+    SUGG_STATE.active = false;
+    SUGG_STATE.lines = new Map();
+    SUGG_STATE.lastSeenAt = 0;
+    SUGG_STATE.lastEmptyAt = 0;
+  } catch (_) {}
+  try { console.warn("[PosEyeDOM] Tracking disabled:", reason || "unknown"); } catch (_) {}
+}
+
+function safeSendMessage(msg, cb) {
+  if (TRACKING_DISABLED) return false;
+  try {
+    // If runtime is missing, extension context is gone.
+    if (!chrome || !chrome.runtime || !chrome.runtime.id) {
+      disableTracking("runtime_missing");
+      return false;
+    }
+    chrome.runtime.sendMessage(msg, cb);
+    return true;
+  } catch (e) {
+    const s = (e && e.message) ? e.message : String(e);
+    if (/Extension context invalidated/i.test(s) || /context invalidated/i.test(s)) {
+      disableTracking("context_invalidated");
+      return false;
+    }
+    // Other errors: keep existing behavior but don't crash.
+    try { console.warn("[PosEyeDOM] sendMessage failed:", s); } catch (_) {}
+    return false;
+  }
+}
+
 // --- IA/HTML computation (ported from your Python script) ---
 // Simple and readable implementation.
 (function attachIAComputerOnContent() {
@@ -281,6 +320,48 @@ let CONFIG = {
   errorMarginV: 22
 };
 
+// --- Frame / dedupe helpers ---
+function isTopFrame() {
+  try { return window.top === window; } catch (_) { return true; }
+}
+
+function findEditorRoot() {
+  try {
+    // Prefer the stable wrapper used by github.dev
+    const a = document.querySelector(".editor-instance");
+    if (a) return a;
+    // Fallbacks for Monaco/VS Code web layouts
+    const b = document.querySelector(".monaco-editor");
+    if (b) return b;
+    const c = document.querySelector(".view-lines");
+    if (c && c.closest) return c.closest(".monaco-editor") || c.parentElement || c;
+  } catch (_) {}
+  return null;
+}
+
+let LAST_COORD_SIG = null;
+let LAST_COORD_AT = 0;
+
+function buildCoordsSignature(coords) {
+  // Compact signature to dedupe repeat snapshots; avoid hashing huge HTML.
+  try {
+    if (!Array.isArray(coords) || coords.length === 0) return "empty";
+    const round = (n) => {
+      const v = Number(n);
+      if (!Number.isFinite(v)) return "NaN";
+      return (Math.round(v * 2) / 2).toFixed(1); // 0.5px precision
+    };
+    const parts = coords.map(c => {
+      const txt = (c && c.text) ? String(c.text) : "";
+      const t = txt.length > 80 ? txt.slice(0, 80) : txt;
+      return `${round(c.x)},${round(c.y)},${round(c.width)},${round(c.height)}:${t}`;
+    });
+    return `${coords.length}|` + parts.join(";");
+  } catch (_) {
+    return "sig_err";
+  }
+}
+
 function loadConfig(callback) {
   try {
     chrome.storage.sync.get({ ...CONFIG, throttleMs: 200, browserWindowOffset: 91, errorMarginH: 44, errorMarginV: 22 }, (cfg) => {
@@ -291,7 +372,7 @@ function loadConfig(callback) {
 }
 
 try {
-  chrome.runtime.onMessage.addListener((message) => {
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message && message.type === "settings_updated") {
       const incoming = (message && message.data) ? message.data : null;
       if (incoming && typeof incoming === 'object') {
@@ -314,7 +395,20 @@ try {
         try { startObserver(); } catch (_) {}
         try { detectSuggestionAcceptance(); } catch (_) {}
         try { logDivCoordinates(); } catch (_) {}
+        try { sendResponse && sendResponse({ ok: true }); } catch (_) {}
       });
+      return true; // async response
+    } else if (message && message.type === "force_reattach") {
+      // Manual repair: restart observer + detection (similar to a page reload / script reinjection).
+      loadConfig(() => {
+        try { refreshThrottle(); } catch (_) {}
+        try { stopObserver(); } catch (_) {}
+        try { startObserver(); } catch (_) {}
+        try { detectSuggestionAcceptance(); } catch (_) {}
+        try { logDivCoordinates(); } catch (_) {}
+        try { sendResponse && sendResponse({ ok: true }); } catch (_) {}
+      });
+      return true; // async response
     }
   });
 } catch (e) { /* ignore */ }
@@ -324,35 +418,56 @@ loadConfig();
 // Logs coordinates and outerHTML for divs with the specified classes.
 function logDivCoordinates() {
   try {
-    const viewLines = document.querySelector(".editor-instance");
+    if (TRACKING_DISABLED) return;
+    const viewLines = findEditorRoot();
     const divs = viewLines
       ? viewLines.querySelectorAll(CONFIG.selectors)
       : document.querySelectorAll(CONFIG.selectors);
 
     const coordinates = Array.from(divs).map(div => {
       const rect = div.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+      if (!isElementVisible(div)) return null;
+      const text = (div && div.textContent) ? String(div.textContent).trim() : "";
       return {
         x: rect.left,
         y: rect.top,
         width: rect.width,
         height: rect.height,
-        html: div.outerHTML
+        html: div.outerHTML,
+        text
       };
-    });
+    }).filter(Boolean);
+
+    // Dedupe identical snapshots in this frame (common during bursty mutations)
+    const sig = buildCoordsSignature(coordinates);
+    const now = Date.now();
+    if (sig === LAST_COORD_SIG && (now - LAST_COORD_AT) < 300) {
+      return;
+    }
+    LAST_COORD_SIG = sig;
+    LAST_COORD_AT = now;
 
     const timestamp = new Date().toISOString();
     console.log("Logged div coordinates:", coordinates, "Timestamp:", timestamp);
 
     // Send the log to the background script
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       type: "log_coordinates",
       data: {
         message: "Div coordinates logged",
         coordinates: coordinates,
-        timestamp: timestamp
+        timestamp: timestamp,
+        signature: sig,
+        frame: { top: isTopFrame(), href: (typeof location !== "undefined" ? location.href : "") }
       }
     });
   } catch (err) {
+    const s = (err && err.message) ? err.message : String(err);
+    if (/Extension context invalidated/i.test(s) || /context invalidated/i.test(s)) {
+      disableTracking("context_invalidated");
+      return;
+    }
     console.error("Error in logDivCoordinates:", err);
   }
 }
@@ -360,6 +475,7 @@ function logDivCoordinates() {
 // Global variables for the MutationObserver and its status.
 let observer = null;
 let observerActive = false;
+let observerRoot = null;
 
 // Create a throttled version of logDivCoordinates using configurable delay
 let throttledLogDivCoordinates = throttle(logDivCoordinates, 200);
@@ -372,6 +488,61 @@ refreshThrottle();
 // Suggestion acceptance detection state and helpers
 const GHOST_CLASSES = ".ghost-text-decoration, .ghost-text, .ghost-text-decoration-preview";
 let SUGG_STATE = { active: false, lines: new Map(), lastSeenAt: 0, compareTimer: null, lastEmptyAt: 0 };
+let ACTIVE_POLL_TIMER = null;
+
+function sendEmptySnapshot(reason) {
+  try {
+    if (TRACKING_DISABLED) return;
+    const timestamp = new Date().toISOString();
+    const sig = `empty:${String(reason || "unknown")}`;
+    // Reset local dedupe so this empty snapshot isn't dropped due to prior empties.
+    try { LAST_COORD_SIG = null; LAST_COORD_AT = 0; } catch (_) {}
+    safeSendMessage({
+      type: "log_coordinates",
+      data: {
+        message: `Forced empty snapshot (${sig})`,
+        coordinates: [],
+        timestamp,
+        signature: sig,
+        frame: { top: isTopFrame(), href: (typeof location !== "undefined" ? location.href : "") }
+      }
+    });
+  } catch (_) {}
+}
+
+function ensureActivePoll() {
+  if (ACTIVE_POLL_TIMER) return;
+  // Some dismissals (e.g. ESC) can hide ghosts with minimal DOM churn; poll lightly while active.
+  ACTIVE_POLL_TIMER = setInterval(() => {
+    try {
+      if (!SUGG_STATE.active) return;
+      detectSuggestionAcceptance();
+      throttledLogDivCoordinates();
+    } catch (_) {}
+  }, 250);
+}
+
+function stopActivePoll() {
+  if (!ACTIVE_POLL_TIMER) return;
+  try { clearInterval(ACTIVE_POLL_TIMER); } catch (_) {}
+  ACTIVE_POLL_TIMER = null;
+}
+
+function forceRejectOnFocusLoss(reason) {
+  // Requirement: when leaving/unfocusing, treat the current visible suggestion as rejected at that moment.
+  try {
+    sendEmptySnapshot(reason || "focus_loss");
+  } catch (_) {}
+  try {
+    // Clear acceptance detection state immediately so it doesn't "finish" later with a bad timestamp.
+    if (SUGG_STATE && SUGG_STATE.compareTimer) { try { clearTimeout(SUGG_STATE.compareTimer); } catch (_) {} SUGG_STATE.compareTimer = null; }
+    SUGG_STATE.active = false;
+    SUGG_STATE.lines = new Map();
+    SUGG_STATE.lastSeenAt = 0;
+    SUGG_STATE.lastEmptyAt = 0;
+  } catch (_) {}
+  try { stopActivePoll(); } catch (_) {}
+}
 
 function extractTopPxFromStyle(el) {
   // Try inline style object first
@@ -446,6 +617,23 @@ function normalizeText(s) {
   return (s || "").replace(/[\u00A0\s]+/g, "");
 }
 
+function isElementVisible(el) {
+  try {
+    if (!el || el.nodeType !== 1) return false;
+    const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+    const cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    if (cs) {
+      if (cs.display === "none" || cs.visibility === "hidden") return false;
+      const op = parseFloat(cs.opacity || "1");
+      if (Number.isFinite(op) && op <= 0.05) return false;
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function collectGhostLines() {
   try {
     const root = document.querySelector(".editor-instance") || document;
@@ -453,7 +641,12 @@ function collectGhostLines() {
     const blocks = [];
     for (let i = 0; i < lines.length; i++) {
       const lineEl = lines[i];
-      const hasGhost = !!lineEl.querySelector(CONFIG.selectors);
+      // Treat "dismissed" suggestions as absent when ghost elements are hidden (opacity/display)
+      let hasGhost = false;
+      try {
+        const ghosts = lineEl.querySelectorAll(CONFIG.selectors);
+        hasGhost = Array.from(ghosts).some(isElementVisible);
+      } catch (_) { hasGhost = false; }
       if (!hasGhost) continue;
       const isPreview = !!lineEl.closest(".suggest-preview-text");
       if (isPreview) continue; // anchor must be a non-preview line with ghosts
@@ -462,7 +655,7 @@ function collectGhostLines() {
       let combined = "";
       try {
         const ghostsInLine = lineEl.querySelectorAll(CONFIG.selectors);
-        combined = Array.from(ghostsInLine).map(el => el.textContent || "").join("");
+        combined = Array.from(ghostsInLine).filter(isElementVisible).map(el => el.textContent || "").join("");
       } catch (_) {
         combined = lineEl.textContent || "";
       }
@@ -472,11 +665,15 @@ function collectGhostLines() {
         const nextLine = lines[j];
         const inPreview = !!nextLine.closest(".suggest-preview-text");
         if (!inPreview) break;
-        const nextHasGhost = !!nextLine.querySelector(CONFIG.selectors);
+        let nextHasGhost = false;
+        try {
+          const ghosts = nextLine.querySelectorAll(CONFIG.selectors);
+          nextHasGhost = Array.from(ghosts).some(isElementVisible);
+        } catch (_) { nextHasGhost = false; }
         if (!nextHasGhost) break;
         try {
           const ghostsInNext = nextLine.querySelectorAll(CONFIG.selectors);
-          const t = Array.from(ghostsInNext).map(el => el.textContent || "").join("");
+          const t = Array.from(ghostsInNext).filter(isElementVisible).map(el => el.textContent || "").join("");
           combined += "\n" + t;
         } catch (_) {
           combined += "\n" + (nextLine.textContent || "");
@@ -492,12 +689,17 @@ function collectGhostLines() {
       previews.forEach((pv) => {
         try {
           // Gather preview child lines with ghosts only
-          const childLines = Array.from(pv.querySelectorAll('.view-line')).filter(el => !!el.querySelector(CONFIG.selectors));
+          const childLines = Array.from(pv.querySelectorAll('.view-line')).filter(el => {
+            try {
+              const ghosts = el.querySelectorAll(CONFIG.selectors);
+              return Array.from(ghosts).some(isElementVisible);
+            } catch (_) { return false; }
+          });
           if (childLines.length === 0) return;
           const combined = childLines.map(pl => {
             try {
               const ghosts = pl.querySelectorAll(CONFIG.selectors);
-              return Array.from(ghosts).map(el => el.textContent || '').join('');
+              return Array.from(ghosts).filter(isElementVisible).map(el => el.textContent || '').join('');
             } catch (_) { return pl.textContent || ''; }
           }).join('\n');
 
@@ -576,44 +778,62 @@ function runAcceptanceCompare() {
   } catch (_) {}
   if (!(SUGG_STATE.active && SUGG_STATE.lines && SUGG_STATE.lines.size > 0)) return;
   console.log("[Acceptance] ghosts disappeared, running comparison for", SUGG_STATE.lines.size, "anchor(s)");
-  let comparable = true;
-  let allMatch = true;
+  let anyOk = false;
+  let bestIdx = null;
+  let bestTop = null;
+  let totalAnchors = 0;
   const linesForLog = [];
+
+  const MAX_MATCH_PREFIX_CHARS = 1200;
+
   SUGG_STATE.lines.forEach((v) => {
+    totalAnchors += 1;
     const combinedCurrent = collectDownwardTextFromTop(v.top, v.lineHeight);
-    const nowNorm = normalizeText(combinedCurrent);
     const expectedNorm = String(v.snapshotNorm || "");
     linesForLog.push({ top: v.top, expectedText: v.snapshotText, nowText: combinedCurrent });
-    const idx = nowNorm.indexOf(expectedNorm);
-    const ok = idx >= 0 && idx < Math.min(nowNorm.length, 1200);
-    if (!ok) allMatch = false;
+
+    const nowNorm = normalizeText(combinedCurrent);
+    const idx = expectedNorm ? nowNorm.indexOf(expectedNorm) : -1;
+    const ok = idx >= 0 && idx < Math.min(nowNorm.length, MAX_MATCH_PREFIX_CHARS);
+    if (ok) {
+      anyOk = true;
+      if (bestIdx === null || idx < bestIdx) { bestIdx = idx; bestTop = v.top; }
+    }
     try {
       const trunc = (s) => (s.length > 240 ? s.slice(0, 240) + `... (${s.length} chars)` : s + ` (${s.length} chars)`);
-      const windowStr = idx >= 0 ? nowNorm.slice(Math.max(0, idx), Math.min(nowNorm.length, idx + expectedNorm.length)) : "";
       console.log("[AcceptanceCheck] top=", v.top,
         "\nexpectedRaw=\n", trunc(v.snapshotText || ""),
         "\ncurrentRaw=\n", trunc(combinedCurrent || ""),
         "\nexpectedNorm=\n", trunc(expectedNorm),
-        "\ncurrentNormWindow=\n", trunc(windowStr),
         "\nindex=", idx, " match=", ok);
       // Emit event for background consumption (both true and false)
       try {
-        chrome.runtime.sendMessage({ type: "log_acceptance_check", data: { top: v.top, ok, detectedAt: new Date().toISOString(), expectedText: v.snapshotText, nowText: combinedCurrent } });
+        safeSendMessage({ type: "log_acceptance_check", data: { top: v.top, ok, idx, detectedAt: new Date().toISOString(), expectedText: v.snapshotText, nowText: combinedCurrent } });
       } catch(_) {}
     } catch (_) {}
   });
-  if (comparable && allMatch) {
+
+  const accepted = anyOk;
+
+  if (accepted) {
     try {
-      chrome.runtime.sendMessage({
+      safeSendMessage({
         type: "log_acceptance",
-        data: { message: "Suggestion accepted", lines: linesForLog, seenAt: SUGG_STATE.lastSeenAt, detectedAt: new Date().toISOString() }
+        data: {
+          message: "Suggestion accepted",
+          lines: linesForLog,
+          seenAt: SUGG_STATE.lastSeenAt,
+          detectedAt: new Date().toISOString(),
+          decision: { bestTop, bestIdx, totalAnchors, rule: { maxMatchPrefixChars: MAX_MATCH_PREFIX_CHARS } }
+        }
       });
-      console.log("[Acceptance] accepted=true for", SUGG_STATE.lines.size, "anchor(s)");
+      console.log("[Acceptance] accepted=true", { bestTop, bestIdx, totalAnchors });
     } catch (e) { /* ignore */ }
   } else {
-    console.log("[Acceptance] accepted=false");
+    console.log("[Acceptance] accepted=false", { totalAnchors });
   }
   SUGG_STATE.active = false;
+  stopActivePoll();
   SUGG_STATE.lines = new Map();
   SUGG_STATE.lastSeenAt = 0;
   SUGG_STATE.compareTimer = null;
@@ -627,6 +847,7 @@ function detectSuggestionAcceptance() {
       const newMap = new Map();
       ghosts.forEach(g => { newMap.set(`top:${g.top}`, { top: g.top, height: g.height, lineHeight: g.lineHeight, snapshotText: g.snapshotText, snapshotNorm: g.snapshotNorm }); });
       SUGG_STATE.active = true;
+      ensureActivePoll();
       SUGG_STATE.lines = newMap;
       SUGG_STATE.lastSeenAt = Date.now();
       SUGG_STATE.lastEmptyAt = 0;
@@ -655,6 +876,7 @@ function detectSuggestionAcceptance() {
         console.log("[Acceptance] awaiting stable absence", stableMs, "ms");
       }
     } else {
+      stopActivePoll();
       SUGG_STATE.lastEmptyAt = 0;
     }
   } catch (err) {
@@ -662,28 +884,116 @@ function detectSuggestionAcceptance() {
   }
 }
 
+// Force a state check on ESC to catch dismissals that hide ghosts without obvious DOM mutations.
+try {
+  window.addEventListener("keydown", (e) => {
+    try {
+      if (!e || e.key !== "Escape") return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      // If a suggestion was active (or is currently visible), force a detection + snapshot.
+      setTimeout(() => {
+        try { detectSuggestionAcceptance(); } catch (_) {}
+        try { logDivCoordinates(); } catch (_) {}
+      }, 0);
+    } catch (_) {}
+  }, { capture: true });
+} catch (_) {}
+
+// If we leave the editor/tab/window, ghost suggestions can disappear due to CSS focus state without any DOM mutation.
+// MutationObserver doesn't fire on "visual-only" changes, so we force-close the suggestion at blur/hidden time.
+try {
+  window.addEventListener("blur", () => {
+    try { forceRejectOnFocusLoss("window_blur"); } catch (_) {}
+  }, { capture: true });
+} catch (_) {}
+
+try {
+  document.addEventListener("visibilitychange", () => {
+    try {
+      if (document.hidden) forceRejectOnFocusLoss("document_hidden");
+    } catch (_) {}
+  }, { capture: true });
+} catch (_) {}
+
 // Callback for the MutationObserver.
 function observerCallback(mutationsList, observer) {
+  // Only react to mutations likely related to ghost suggestions to reduce noise/overhead.
+  let relevant = false;
+  try {
+    const sel = CONFIG && CONFIG.selectors ? CONFIG.selectors : GHOST_CLASSES;
+    for (const m of (mutationsList || [])) {
+      if (!m) continue;
+      if (m.type === "childList") {
+        const scan = (node) => {
+          try {
+            if (!node) return false;
+            if (node.nodeType === 1) {
+              const el = node;
+              if (el.matches && el.matches(sel)) return true;
+              if (el.closest && el.closest(".suggest-preview-text")) return true;
+              if (el.querySelector && (el.querySelector(sel) || el.querySelector(".suggest-preview-text"))) return true;
+            }
+          } catch (_) {}
+          return false;
+        };
+        for (const n of Array.from(m.addedNodes || [])) { if (scan(n)) { relevant = true; break; } }
+        if (!relevant) for (const n of Array.from(m.removedNodes || [])) { if (scan(n)) { relevant = true; break; } }
+      } else if (m.type === "attributes") {
+        const t = m.target;
+        try {
+          if (t && t.matches && (t.matches(sel) || t.closest(".suggest-preview-text"))) { relevant = true; }
+          else if (t && t.querySelector && (t.querySelector(sel) || t.querySelector(".suggest-preview-text"))) { relevant = true; }
+        } catch (_) {}
+      } else if (m.type === "characterData") {
+        // Ghost text changes can be characterData on a Text node inside the ghost element
+        try {
+          const p = m.target && m.target.parentElement;
+          if (p && p.closest && p.closest(".ghost-text, .ghost-text-decoration, .ghost-text-decoration-preview, .suggest-preview-text")) relevant = true;
+        } catch (_) {}
+      }
+      if (relevant) break;
+    }
+  } catch (_) {}
+
+  if (!relevant) return;
   detectSuggestionAcceptance();
   throttledLogDivCoordinates();
 }
 
 // Starts the MutationObserver on the .editor-instance element.
 function startObserver() {
-  if (observer) {
-    console.log("Observer already running.");
+  // If we have an observer but the root was replaced/disconnected, restart it.
+  try {
+    if (observer && observerRoot && observerRoot.isConnected === false) {
+      stopObserver();
+    }
+  } catch (_) {}
+
+  const root = findEditorRoot();
+  if (!root) {
+    // No editor yet; keep observer stopped.
+    stopObserver();
     return;
   }
-  const viewLinesElement = document.querySelector(".editor-instance");
-  if (viewLinesElement) {
-    observer = new MutationObserver(observerCallback);
-    observer.observe(viewLinesElement, { attributes: true, childList: true, subtree: true, attributeFilter: ['class'] });
+
+  // If already observing the current root, do nothing.
+  if (observer && observerRoot === root) {
     observerActive = true;
-    console.log("Observer started on .editor-instance");
-  } else {
-    console.warn('Element with class "editor-instance" not found.');
-    stopObserver();
+    return;
   }
+
+  // Otherwise restart on the new root.
+  stopObserver();
+  observerRoot = root;
+  observer = new MutationObserver(observerCallback);
+  observer.observe(root, {
+    attributes: true,
+    attributeFilter: ["class", "style"],
+    childList: true,
+    subtree: true,
+    characterData: true
+  });
+  observerActive = true;
 }
 
 // Stops the MutationObserver.
@@ -692,6 +1002,7 @@ function stopObserver() {
     observer.disconnect();
     observer = null;
     observerActive = false;
+    observerRoot = null;
     console.log("Observer stopped.");
   } else {
     console.log("Observer is not running.");
@@ -702,20 +1013,27 @@ function stopObserver() {
 if (window.location.hostname.endsWith('github.dev')) {
   // Every 10 seconds, ensure the observer is running.
   setInterval(() => {
-    console.log("Watcher attempting to start observer on github.dev tab.");
+    // Keep this quiet; it's purely a watchdog.
     try { startObserver(); } catch (err) { console.error("Error starting observer:", err); }
   }, 10000);
 
   // Every 10 seconds, request the complete DB content and POST it.
   setInterval(() => {
     try {
-      chrome.runtime.sendMessage({ type: "export_logs" }, response => {
+      // Avoid accidental fetch("") / spam when remoteUrl is not configured.
+      const url = (CONFIG && typeof CONFIG.remoteUrl === "string") ? CONFIG.remoteUrl.trim() : "";
+      if (!url) return;
+      if (!/^https?:\/\//i.test(url)) return;
+      // Only POST from the top frame to avoid duplicate uploads.
+      if (!isTopFrame()) return;
+
+      safeSendMessage({ type: "export_logs" }, response => {
         if (chrome.runtime.lastError) {
           console.error("Runtime error while exporting logs:", chrome.runtime.lastError.message);
           return;
         }
         if (response && response.logs) {
-          fetch(CONFIG.remoteUrl, {
+          fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(response.logs)
@@ -749,7 +1067,7 @@ if (window.location.hostname.endsWith('github.dev')) {
       console.log("First sync key press logged", "key:", CONFIG.syncKey, "Timestamp:", timestamp);
 
       try {
-        chrome.runtime.sendMessage({
+        safeSendMessage({
           type: "log_keypress",
           data: { message: "First 's' key press logged", timestamp }
         });

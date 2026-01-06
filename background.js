@@ -1,5 +1,17 @@
 let db;
 
+// Dedupe repeated coordinate snapshots (common with bursty DOM mutations and multi-frame injection)
+const LAST_COORD_SIG_BY_SENDER = new Map(); // key -> { sig, at }
+function senderKey(sender) {
+  try {
+    const tabId = sender && sender.tab && typeof sender.tab.id === 'number' ? sender.tab.id : 'no_tab';
+    const frameId = sender && typeof sender.frameId === 'number' ? sender.frameId : 0;
+    return `${tabId}:${frameId}`;
+  } catch (_) {
+    return "unknown";
+  }
+}
+
 // Initialize the database.
 function initDatabase() {
   const request = indexedDB.open("DivLoggerDB", 2);
@@ -161,6 +173,21 @@ function computeIAIncrementalFromLogs(logs, opts) {
     }
   }
 
+  function getBaseKeyFromFullKey(fullKey) {
+    try { return String(fullKey || "").split("::")[0]; } catch (_) { return String(fullKey || ""); }
+  }
+
+  function flushUnusedBaseLabels() {
+    // Mirror the offline grouper: once a baseKey is no longer active, forget it so a future reappearance becomes a new root label.
+    try {
+      const activeBases = new Set(Array.from(activeRecords.keys()).map(getBaseKeyFromFullKey));
+      Object.keys(labelState).forEach((base) => {
+        if (base === "_counter") return;
+        if (!activeBases.has(base)) delete labelState[base];
+      });
+    } catch (_) {}
+  }
+
   function assignLabel(baseKey, currentPos) {
     let info = labelState[baseKey];
     if (!info) {
@@ -210,6 +237,7 @@ function computeIAIncrementalFromLogs(logs, opts) {
         iaClosed.push(rec);
         activeRecords.delete(key);
       }
+      flushUnusedBaseLabels();
       lastProcessedIso = entry.timestamp;
       continue;
     }
@@ -296,6 +324,7 @@ function computeIAIncrementalFromLogs(logs, opts) {
         activeRecords.delete(key);
       }
     }
+    flushUnusedBaseLabels();
 
     lastProcessedIso = entry.timestamp;
   }
@@ -413,7 +442,8 @@ function getIasSummary(callback) {
           y: r.y,
           width: (typeof r.right === 'number' && typeof r.x === 'number') ? (r.right - r.x) : undefined,
           height: (typeof r.bottom === 'number' && typeof r.y === 'number') ? (r.bottom - r.y) : undefined,
-          html: r.html
+          html: r.html,
+          isActive: true
         }));
         const closedSummaries = (closed || []).map(r => ({
           label: r.label,
@@ -423,50 +453,22 @@ function getIasSummary(callback) {
           y: r.y,
           width: (typeof r.right === 'number' && typeof r.x === 'number') ? (r.right - r.x) : undefined,
           height: (typeof r.bottom === 'number' && typeof r.y === 'number') ? (r.bottom - r.y) : undefined,
-          html: r.html
+          html: r.html,
+          isActive: false
         }));
         const all = closedSummaries.concat(activeSummaries);
         all.sort((a, b) => a.start - b.start);
 
         const rootOf = (label) => { const m = (label || "").match(/^(autolabel_\d+)/); return m ? m[1] : (label || ""); };
 
-        // Use persisted acceptedRoots to avoid flipping prior accepted suggestions
+        // Use persisted acceptedRoots to avoid flipping prior accepted suggestions.
+        // IMPORTANT: do NOT infer acceptance from recent checks; that can wrongly mark the next visible suggestion as accepted.
         const acceptedRootsPersisted = Array.isArray(meta && meta.acceptedRoots) ? new Set(meta.acceptedRoots) : new Set();
-        // Simplified mapping: when recent AcceptanceCheck ok=true exists, also mark lastPrimaryRoot
-        const lastPrimaryRoot = meta && typeof meta.lastPrimaryRoot === 'string' ? meta.lastPrimaryRoot : null;
-        const recentChecks = Array.isArray(meta && meta.recentChecks) ? meta.recentChecks : [];
-        const hasRecentOk = recentChecks.slice(-10).some(c => c && c.ok === true);
-        if (Number.isFinite(baseEpochMs)) {
-          try {
-            viewLogs((logs) => {
-              try {
-                const acceptedRoots = new Set(acceptedRootsPersisted);
-                if (hasRecentOk && lastPrimaryRoot) {
-                  acceptedRoots.add(lastPrimaryRoot);
-                  try { console.log('[MatchingCheck]', { reason: 'primaryRoot-recentOk', root: lastPrimaryRoot }); } catch (_) {}
-                }
-                for (const r of all) { r.accepted = acceptedRoots.has(rootOf(r.label)); }
-
-                // Limit to latest 200 records with earliest-per-root inclusion
-                let trimmed = all.slice(-200);
-                try {
-                  const presentRoots = new Set(trimmed.map(r => rootOf(r.label)));
-                  if (presentRoots.size > 0) {
-                    const earliestByRoot = new Map();
-                    for (const r of all) { const rt = rootOf(r.label); if (!earliestByRoot.has(rt)) earliestByRoot.set(rt, r); }
-                    const existingKeys = new Set(trimmed.map(r => `${r.label}|${r.start}|${r.end}`));
-                    for (const rt of presentRoots) { const first = earliestByRoot.get(rt); if (first) { const key = `${first.label}|${first.start}|${first.end}`; if (!existingKeys.has(key)) trimmed.push(first); } }
-                    trimmed.sort((a, b) => a.start - b.start);
-                  }
-                } catch (_) {}
-                callback({ ok: true, records: trimmed });
-              } catch (e) {
-                console.error('getIasSummary simplified mapping error', e);
-                callback({ ok: true, records: all.slice(-200) });
-              }
-            });
-            return; // async branch
-          } catch (_) {}
+        for (const r of all) {
+          const isAccepted = acceptedRootsPersisted.has(rootOf(r.label));
+          // While a suggestion is still visible, treat acceptance as "pending" in the UI.
+          // (It can only be known once it disappears and we run the compare.)
+          r.accepted = r.isActive ? null : isAccepted;
         }
 
         let trimmed = all.slice(-200);
@@ -538,6 +540,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return; // nothing to respond
     }
     if (message.type === "log_coordinates") {
+      // Dedupe identical signatures from the same tab+frame within a short window
+      try {
+        const sig = message && message.data && typeof message.data.signature === "string" ? message.data.signature : null;
+        if (sig) {
+          const key = senderKey(sender);
+          const prev = LAST_COORD_SIG_BY_SENDER.get(key);
+          const now = Date.now();
+          if (prev && prev.sig === sig && (now - prev.at) < 500) {
+            return;
+          }
+          LAST_COORD_SIG_BY_SENDER.set(key, { sig, at: now });
+        }
+      } catch (_) {}
+
       const logEntry = {
         timestamp: new Date().toISOString(),
         coordinates: message.data,
@@ -559,27 +575,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         event: { type: 'suggestion_accepted', ...data }
       };
       saveLogToDatabase(entry);
-      // Also persist the currently primary visible root as accepted to avoid future flips
-      readMeta((meta) => {
-        try {
-          const acceptedRoots = Array.isArray(meta && meta.acceptedRoots) ? meta.acceptedRoots.slice() : [];
-          const root = (meta && typeof meta.lastPrimaryRoot === 'string') ? meta.lastPrimaryRoot : null;
-          if (root && !acceptedRoots.includes(root)) acceptedRoots.push(root);
-          const newMeta = {
-            baseEpochMs: meta ? meta.baseEpochMs : null,
-            lastProcessedIso: meta ? meta.lastProcessedIso : null,
-            labelState: meta ? meta.labelState : { _counter: 1 },
-            nextId: meta ? meta.nextId : 1,
-            activeRecords: meta ? meta.activeRecords : [],
-            lastVisibleRoots: meta && Array.isArray(meta.lastVisibleRoots) ? meta.lastVisibleRoots : [],
-            lastVisibleAt: meta ? meta.lastVisibleAt : null,
-            lastPrimaryRoot: meta ? meta.lastPrimaryRoot : null,
-            lastPrimaryAt: meta ? meta.lastPrimaryAt : null,
-            acceptedRoots,
-            recentChecks: Array.isArray(meta && meta.recentChecks) ? meta.recentChecks.slice(-20) : []
-          };
-          writeMeta(newMeta, () => { try { console.log('[MatchingCheck]', { reason: 'acceptedRoots-update', root }); } catch(_) {} });
-        } catch (e) { console.error('acceptedRoots update error', e); }
+      // Persist acceptance against the *current* primary root.
+      // IMPORTANT: run updateIasCache first so meta.lastPrimaryRoot reflects the most recent logs;
+      // otherwise we can mark the wrong root (leading to "match=true but UI shows rejected").
+      updateIasCache(() => {
+        readMeta((meta) => {
+          try {
+            const acceptedRoots = Array.isArray(meta && meta.acceptedRoots) ? meta.acceptedRoots.slice() : [];
+            const root = (meta && typeof meta.lastPrimaryRoot === 'string') ? meta.lastPrimaryRoot : null;
+            if (root && !acceptedRoots.includes(root)) acceptedRoots.push(root);
+            const newMeta = {
+              baseEpochMs: meta ? meta.baseEpochMs : null,
+              lastProcessedIso: meta ? meta.lastProcessedIso : null,
+              labelState: meta ? meta.labelState : { _counter: 1 },
+              nextId: meta ? meta.nextId : 1,
+              activeRecords: meta ? meta.activeRecords : [],
+              lastVisibleRoots: meta && Array.isArray(meta.lastVisibleRoots) ? meta.lastVisibleRoots : [],
+              lastVisibleAt: meta ? meta.lastVisibleAt : null,
+              lastPrimaryRoot: meta ? meta.lastPrimaryRoot : null,
+              lastPrimaryAt: meta ? meta.lastPrimaryAt : null,
+              acceptedRoots,
+              recentChecks: Array.isArray(meta && meta.recentChecks) ? meta.recentChecks.slice(-20) : []
+            };
+            writeMeta(newMeta, () => { try { console.log('[MatchingCheck]', { reason: 'acceptedRoots-update', root }); } catch(_) {} });
+          } catch (e) { console.error('acceptedRoots update error', e); }
+        });
       });
     } else if (message.type === "log_acceptance_check") {
       // Store rolling buffer of checks
