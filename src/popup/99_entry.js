@@ -123,6 +123,19 @@
     document.getElementById("reset-settings").addEventListener("click", NS.api.resetSettings);
   } catch (_) {}
 
+  // Bug report link
+  try {
+    const reportLink = document.getElementById("report-bug-link");
+    if (reportLink) {
+      reportLink.addEventListener("click", (e) => {
+        try {
+          e.preventDefault();
+          chrome.tabs.create({ url: "https://github.com/Taremeh/PosEyeDOM" });
+        } catch (_) {}
+      });
+    }
+  } catch (_) {}
+
   // Tracking chip reattach
   try {
     const trackingChip = document.getElementById("status-tracking-chip");

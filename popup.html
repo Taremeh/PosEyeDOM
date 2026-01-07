@@ -63,6 +63,23 @@
         color: #b6d7ff;
         animation: liveChipPulse 1.2s ease-in-out infinite;
       }
+      .footer {
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px solid var(--line);
+        font-size: 12px;
+        color: var(--muted);
+        display: flex;
+        justify-content: flex-end;
+      }
+      .footer a {
+        color: var(--muted);
+        text-decoration: none;
+      }
+      .footer a:hover {
+        text-decoration: underline;
+        color: var(--text);
+      }
       @keyframes liveChipPulse {
         0% { filter: brightness(1.0); box-shadow: 0 0 0 0 rgba(88,166,255,0.35); }
         60% { filter: brightness(1.15); box-shadow: 0 0 0 8px rgba(88,166,255,0.0); }
@@ -171,6 +188,15 @@
       </div>
       <div class="small" id="settings-status"></div>
       <div class="small muted" style="margin-top:6px;">Saving changes will trigger a VS Code and Extension Reload.</div>
+    </div>
+
+    <div class="footer">
+      <a
+        id="report-bug-link"
+        href="https://github.com/Taremeh/PosEyeDOM"
+        target="_blank"
+        rel="noopener noreferrer"
+      >Experienced a bug? Report it here.</a>
     </div>
 
     <script src="src/popup/00_namespace.js"></script>
